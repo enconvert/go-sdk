@@ -9,7 +9,7 @@ Read any web page or file into clean Markdown, JSON, or screenshots, and get a `
 ## Install
 
 ```bash
-go get github.com/conversionapi/go-sdk
+go get github.com/enconvert/go-sdk
 ```
 
 ## Quick Start
@@ -19,7 +19,7 @@ import (
 	"context"
 	"fmt"
 
-	enconvert "github.com/conversionapi/go-sdk"
+	enconvert "github.com/enconvert/go-sdk"
 )
 
 client, err := enconvert.New("sk_...")

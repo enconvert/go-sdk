@@ -30,4 +30,4 @@
 package enconvert
 
 // Version is the SDK's release version.
-const Version = "0.0.2"
+const Version = "0.1.1"
