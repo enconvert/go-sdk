@@ -77,6 +77,16 @@ batch, err := client.V2.PerceiveBatch(ctx, []string{"https://a.com", "https://b.
 	OutputMode:      enconvert.PerceiveBatchOutputZip,
 })
 done, err := client.V2.GetPerceiveBatch(ctx, batch.JobID)
+
+// Direct download — stream one artifact's raw bytes instead of the JSON envelope
+// (exactly one artifact-producing output; metadata arrives via headers):
+direct, err := client.V2.PerceiveDirect(ctx, "https://example.com", enconvert.PerceiveOptions{
+	Outputs: []enconvert.PerceiveOutputName{enconvert.PerceiveOutputPDF},
+})
+os.WriteFile(direct.Filename, direct.Content, 0o644)
+
+// Re-download a stored artifact later (output "" when the operation has only one):
+saved, err := client.V2.DownloadPerceiveArtifact(ctx, direct.OperationID, enconvert.PerceiveOutputPDF)
 ```
 
 ### Discover — enumerate a site's URLs (no rendering)

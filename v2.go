@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -45,7 +46,6 @@ type PerceiveOutputName string
 
 const (
 	PerceiveOutputMarkdown           PerceiveOutputName = "markdown"
-	PerceiveOutputMarkdownFit        PerceiveOutputName = "markdown_fit"
 	PerceiveOutputHTMLCleaned        PerceiveOutputName = "html_cleaned"
 	PerceiveOutputHTMLRaw            PerceiveOutputName = "html_raw"
 	PerceiveOutputScreenshot         PerceiveOutputName = "screenshot"
@@ -55,6 +55,19 @@ const (
 	PerceiveOutputImages             PerceiveOutputName = "images"
 	PerceiveOutputStructured         PerceiveOutputName = "structured"
 )
+
+// perceiveArtifactOutputs are the artifact-producing outputs accepted by
+// PerceiveDirect ("structured" is inline-only and produces no artifact).
+var perceiveArtifactOutputs = []PerceiveOutputName{
+	PerceiveOutputMarkdown,
+	PerceiveOutputHTMLCleaned,
+	PerceiveOutputHTMLRaw,
+	PerceiveOutputScreenshot,
+	PerceiveOutputScreenshotFullPage,
+	PerceiveOutputPDF,
+	PerceiveOutputLinks,
+	PerceiveOutputImages,
+}
 
 // PerceiveExtractName is a heuristic extraction target.
 type PerceiveExtractName string
@@ -164,6 +177,14 @@ type PerceiveOptions struct {
 	BlockResources []PerceiveResourceType
 	RespectRobots  *bool
 	Mobile         *bool
+	// OnlyMainContent strips site chrome (nav, header, footer, cookie
+	// banners) from the markdown artifact and main_content extract.
+	// Defaults to true server-side; set to false for the full page.
+	OnlyMainContent *bool
+	// DirectDownload makes the HTTP response body the artifact bytes
+	// (Perceive only — PerceiveBatch rejects it with 422). Requires exactly
+	// one artifact-producing output.
+	DirectDownload *bool
 }
 
 // PerceiveBatchOutputMode controls how PerceiveBatch packages results.
@@ -210,7 +231,12 @@ type PerceiveResult struct {
 	ContentHash string
 	// RenderQuality is a 0.0-1.0 render quality score.
 	RenderQuality *float64
-	CacheHit      bool
+	// StatusCode is the HTTP status of the final main-document response.
+	StatusCode *int
+	// Deductions maps named render-quality deductions that fired to their
+	// weight, e.g. {"http_error": 0.7}. Empty on a clean render.
+	Deductions map[string]float64
+	CacheHit   bool
 	// Outputs is keyed by output name (e.g. "markdown",
 	// "screenshot_full_page").
 	Outputs map[string]V2OutputArtifact
@@ -223,6 +249,37 @@ type PerceiveResult struct {
 	DurationMs     *int
 	Error          string
 	Warnings       []string
+	// OptionsEcho echoes the request options the server honoured (secrets
+	// redacted to booleans). Nil when the server omits it.
+	OptionsEcho map[string]any
+}
+
+// PerceiveDirectResult is the outcome of PerceiveDirect and
+// DownloadPerceiveArtifact: the raw artifact bytes plus the metadata the
+// server carries in response headers.
+type PerceiveDirectResult struct {
+	// Content is the raw artifact bytes.
+	Content []byte
+	// ContentType is the artifact media type, e.g.
+	// "text/markdown; charset=utf-8".
+	ContentType string
+	// Filename is parsed from the Content-Disposition header. Empty when
+	// the header is absent.
+	Filename    string
+	OperationID string
+	ObjectKey   string
+	CacheHit    bool
+	// RenderQuality is a 0.0-1.0 render quality score; nil when the header
+	// is absent.
+	RenderQuality *float64
+	// SourceStatusCode is the HTTP status of the upstream main-document
+	// response; nil when the header is absent.
+	SourceStatusCode *int
+	// ContentHash is the artifact sha256; empty when the header is absent.
+	ContentHash string
+	// WarningsCount is the operation's warning count (0 when the header is
+	// absent).
+	WarningsCount int
 }
 
 // PerceiveBatchStatus is the lifecycle state of a perceive batch job.
@@ -823,6 +880,57 @@ func (v *V2) GetPerceiveOperation(ctx context.Context, operationID string) (Perc
 	return toPerceiveResult(data), nil
 }
 
+// PerceiveDirect renders pageURL and streams the single requested artifact
+// back as raw bytes (direct_download) instead of a JSON envelope with
+// signed URLs. Exactly one artifact-producing output must be requested in
+// opts.Outputs (markdown, html_cleaned, html_raw, screenshot,
+// screenshot_full_page, pdf, links, images); the operation metadata
+// arrives via response headers.
+func (v *V2) PerceiveDirect(ctx context.Context, pageURL string, opts PerceiveOptions) (PerceiveDirectResult, error) {
+	if err := validatePerceiveDirectOutputs(opts.Outputs); err != nil {
+		return PerceiveDirectResult{}, err
+	}
+	body := serializePerceiveOptions(opts)
+	body["url"] = pageURL
+	body["direct_download"] = true
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return PerceiveDirectResult{}, err
+	}
+	return v.doBytes(ctx, http.MethodPost, "/v2/perceive", "application/json", bytes.NewReader(payload))
+}
+
+// DownloadPerceiveArtifact streams one stored artifact of an earlier
+// perceive operation as raw bytes. output may be "" when the operation
+// produced exactly one artifact (else the API answers 400 listing the
+// available outputs); a 410 APIError means the artifact passed the plan's
+// retention window.
+func (v *V2) DownloadPerceiveArtifact(ctx context.Context, operationID string, output PerceiveOutputName) (PerceiveDirectResult, error) {
+	requestPath := "/v2/perceive/" + url.PathEscape(operationID) + "?direct_download=true"
+	if output != "" {
+		requestPath += "&output=" + url.QueryEscape(string(output))
+	}
+	return v.doBytes(ctx, http.MethodGet, requestPath, "", nil)
+}
+
+// validatePerceiveDirectOutputs enforces PerceiveDirect's client-side
+// contract: exactly one artifact-producing output requested.
+func validatePerceiveDirectOutputs(outputs []PerceiveOutputName) error {
+	count := 0
+	for _, output := range outputs {
+		for _, artifact := range perceiveArtifactOutputs {
+			if output == artifact {
+				count++
+				break
+			}
+		}
+	}
+	if count != 1 {
+		return fmt.Errorf("perceiveDirect: request exactly one artifact-producing output (markdown, html_cleaned, html_raw, screenshot, screenshot_full_page, pdf, links, images); got %d", count)
+	}
+	return nil
+}
+
 // PerceiveBatch perceives up to 1000 URLs with one shared options block.
 // Small batches run inline (completed result); larger ones return status
 // "queued" — poll GetPerceiveBatch with the JobID.
@@ -1372,6 +1480,25 @@ func (v *V2) deleteJSON(ctx context.Context, requestPath string) (map[string]any
 	return v.client.doJSON(ctx, http.MethodDelete, requestPath, "", nil)
 }
 
+// doBytes issues an authenticated request expecting raw artifact bytes
+// (direct_download). Non-2xx responses carry a normal JSON error body and
+// go through raiseForStatus exactly like the JSON paths.
+func (v *V2) doBytes(ctx context.Context, method, requestPath, contentType string, body io.Reader) (PerceiveDirectResult, error) {
+	resp, err := v.client.request(ctx, method, requestPath, contentType, body)
+	if err != nil {
+		return PerceiveDirectResult{}, err
+	}
+	if err := raiseForStatus(resp); err != nil {
+		return PerceiveDirectResult{}, err
+	}
+	defer resp.Body.Close()
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return PerceiveDirectResult{}, err
+	}
+	return toPerceiveDirectResult(content, resp.Header), nil
+}
+
 func listQuery(opts V2ListOptions) string {
 	params := url.Values{}
 	if opts.Skip != nil {
@@ -1445,6 +1572,12 @@ func serializePerceiveOptions(o PerceiveOptions) map[string]any {
 	}
 	if o.Mobile != nil {
 		out["mobile"] = *o.Mobile
+	}
+	if o.OnlyMainContent != nil {
+		out["only_main_content"] = *o.OnlyMainContent
+	}
+	if o.DirectDownload != nil {
+		out["direct_download"] = *o.DirectDownload
 	}
 	return out
 }
@@ -1533,6 +1666,12 @@ func toPerceiveResult(d map[string]any) PerceiveResult {
 	for name, artifact := range rawOutputs {
 		outputs[name] = toOutputArtifact(artifact)
 	}
+	deductions := map[string]float64{}
+	for name, weight := range mapObject(d, "deductions") {
+		if w, ok := weight.(float64); ok {
+			deductions[name] = w
+		}
+	}
 	return PerceiveResult{
 		OperationID:    mapString(d, "operation_id"),
 		Status:         PerceiveStatus(mapString(d, "status")),
@@ -1540,6 +1679,8 @@ func toPerceiveResult(d map[string]any) PerceiveResult {
 		URLFinal:       mapString(d, "url_final"),
 		ContentHash:    mapString(d, "content_hash"),
 		RenderQuality:  mapOptFloat64(d, "render_quality"),
+		StatusCode:     mapOptInt(d, "status_code"),
+		Deductions:     deductions,
 		CacheHit:       mapBool(d, "cache_hit"),
 		Outputs:        outputs,
 		Structured:     mapObject(d, "structured"),
@@ -1549,7 +1690,45 @@ func toPerceiveResult(d map[string]any) PerceiveResult {
 		DurationMs:     mapOptInt(d, "duration_ms"),
 		Error:          mapString(d, "error"),
 		Warnings:       mapStringSlice(d, "warnings"),
+		OptionsEcho:    mapObject(d, "options_echo"),
 	}
+}
+
+// toPerceiveDirectResult maps a direct-download response's headers onto
+// the result struct. Optional headers may be absent — every parse is
+// guarded, mirroring the JSON mappers.
+func toPerceiveDirectResult(content []byte, header http.Header) PerceiveDirectResult {
+	result := PerceiveDirectResult{
+		Content:     content,
+		ContentType: header.Get("Content-Type"),
+		Filename:    filenameFromDisposition(header.Get("Content-Disposition")),
+		OperationID: header.Get("X-Operation-Id"),
+		ObjectKey:   header.Get("X-Object-Key"),
+		CacheHit:    header.Get("X-Cache-Hit") == "true",
+		ContentHash: header.Get("X-Content-Hash"),
+	}
+	if quality, err := strconv.ParseFloat(header.Get("X-Render-Quality"), 64); err == nil {
+		result.RenderQuality = &quality
+	}
+	if status, err := strconv.Atoi(header.Get("X-Source-Status-Code")); err == nil {
+		result.SourceStatusCode = &status
+	}
+	if warnings, err := strconv.Atoi(header.Get("X-Warnings-Count")); err == nil {
+		result.WarningsCount = warnings
+	}
+	return result
+}
+
+// filenameFromDisposition extracts the filename parameter from a
+// Content-Disposition header, e.g. `attachment; filename="per_x_markdown.md"`.
+func filenameFromDisposition(disposition string) string {
+	if disposition == "" {
+		return ""
+	}
+	if _, params, err := mime.ParseMediaType(disposition); err == nil {
+		return params["filename"]
+	}
+	return ""
 }
 
 func toPerceiveBatchResult(d map[string]any) PerceiveBatchResult {
