@@ -26,6 +26,10 @@ const (
 	defaultBatchTimeout      = 30 * time.Minute
 	defaultPollMaxWait       = 300 * time.Second
 	defaultPollInterval      = 3 * time.Second
+
+	// defaultUserAgent identifies SDK traffic to the gateway (surface
+	// attribution); the "enconvert-sdk/" prefix is what the gateway matches.
+	defaultUserAgent = "enconvert-sdk/" + Version + " (go)"
 )
 
 // Client is the Enconvert file conversion client.
@@ -39,6 +43,7 @@ type Client struct {
 	apiKey     string
 	baseURL    string
 	timeout    time.Duration
+	userAgent  string
 	httpClient *http.Client
 
 	// V2 is the V2 API namespace: perceive, discover, lookup, distill,
@@ -61,15 +66,22 @@ func WithBaseURL(baseURL string) Option {
 	return func(c *Client) { c.baseURL = strings.TrimRight(baseURL, "/") }
 }
 
+// WithUserAgent overrides the User-Agent header sent on every API request
+// (default "enconvert-sdk/<Version> (go)").
+func WithUserAgent(userAgent string) Option {
+	return func(c *Client) { c.userAgent = userAgent }
+}
+
 // New constructs a Client. apiKey is required.
 func New(apiKey string, opts ...Option) (*Client, error) {
 	if apiKey == "" {
 		return nil, errors.New("enconvert: apiKey is required")
 	}
 	c := &Client{
-		apiKey:  apiKey,
-		baseURL: defaultBaseURL,
-		timeout: defaultTimeout,
+		apiKey:    apiKey,
+		baseURL:   defaultBaseURL,
+		timeout:   defaultTimeout,
+		userAgent: defaultUserAgent,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -442,6 +454,7 @@ func (c *Client) request(ctx context.Context, method, requestPath, contentType s
 		return nil, err
 	}
 	req.Header.Set("X-API-Key", c.apiKey)
+	req.Header.Set("User-Agent", c.userAgent)
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
